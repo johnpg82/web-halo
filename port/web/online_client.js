@@ -140,6 +140,10 @@
     serverName: null,
     matchPhase: null,
     waitingForLobby: false,
+    waitingForHost: false,
+    waitingForHandoff: false,
+    awaitingHandoffReady: false,
+    hostEnded: false,
     listingSentAt: 0,
   };
 
@@ -1739,6 +1743,107 @@
     }
   }
 
+  function optionIndex(select, label) {
+    if (!select || !select.options) return 0;
+    for (var index = 0; index < select.options.length; index++) {
+      if (select.options[index].textContent.trim() === label) {
+        var value = Number(select.options[index].value);
+        return Number.isInteger(value) ? value : index;
+      }
+    }
+    return 0;
+  }
+
+  function settingsFromNames(mapName, modeName) {
+    return {
+      mapIndex: optionIndex(elements.map, mapName),
+      modeIndex: optionIndex(elements.mode, modeName),
+      mapName: mapName,
+      modeName: modeName,
+      advanced: null,
+    };
+  }
+
+  function removeAllPeers() {
+    Array.from(session.peerPromises.keys()).forEach(removePeer);
+  }
+
+  function endHostedGame() {
+    if (session.hostEnded && session.leavePromise) return;
+    session.hostEnded = true;
+    session.closing = true;
+    leave(false).then(function() {
+      showDialog();
+      showHome();
+      setHeader("Play online", "offline");
+      setStatus("The host ended the game. Choose another room, or host a new one.");
+      setBusy(false);
+      if (elements.browserQuery && typeof elements.browserQuery.focus === "function") {
+        elements.browserQuery.focus();
+      }
+    });
+  }
+
+  async function acceptHandoff(message, generation, operation) {
+    var guestTicket = session.roomTicket;
+    session.role = "host";
+    syncTelemetryContext();
+    session.roomTicket = message.ticket;
+    session.waitingForLobby = false;
+    session.waitingForHost = false;
+    session.waitingForHandoff = false;
+    session.guestWasJoined = false;
+    session.hostWasReady = false;
+    session.gameCommandIssued = false;
+    session.listPublic = message.listed === true;
+    session.serverName = message.listed === true ? message.name : null;
+    session.hostSettings = settingsFromNames(message.map, message.mode);
+    if (session.room && session.room.id && guestTicket) {
+      session.inviteCode = session.room.id + "." + guestTicket;
+      session.inviteUrl = makeInviteUrl(session.inviteCode);
+    }
+    removeAllPeers();
+    var peers = Array.isArray(message.peers) ? message.peers : [];
+    await Promise.all(peers.map(function(peer) {
+      return ensurePeer(peer, generation, operation);
+    }));
+    showDialog();
+    showProgress();
+    setHeader("You're the host", "waiting");
+    setStatus("The host left. You're starting the next lobby.");
+    try {
+      try { requestGame(COMMAND.CANCEL); } catch (cancelError) { /* Already at the menu. */ }
+      requestConfiguredHost(session.hostSettings);
+      session.gameCommandIssued = true;
+      session.awaitingHandoffReady = true;
+      startGamePolling();
+    } catch (error) {
+      leave(true);
+    }
+  }
+
+  async function followHandoff(message, generation, operation) {
+    session.waitingForHandoff = true;
+    session.waitingForHost = false;
+    session.waitingForLobby = false;
+    session.guestWasJoined = false;
+    session.gameCommandIssued = false;
+    try { requestGame(COMMAND.CANCEL); } catch (error) { /* Not in a match. */ }
+    removeAllPeers();
+    if (typeof message.hostPeerId === "string" && typeof message.identifier === "string") {
+      await ensurePeer({
+        peerId: message.hostPeerId,
+        identifier: message.identifier,
+        role: "host",
+      }, generation, operation);
+    }
+    showDialog();
+    showProgress();
+    setHeader("New host", "waiting");
+    setStatus((message.hostName || "Another player") +
+      " is starting the next lobby. You'll join when it's ready.");
+  }
+
   function beginGuestJoin() {
     if (session.role !== "guest" || session.gameCommandIssued || session.waitingForLobby) return;
     try {
@@ -1769,7 +1874,9 @@
     updateAggregateTransportState();
     if (event.state === "connected") {
       determineConnectionPath(event.peerId);
-      if (session.role === "guest" && !session.gameCommandIssued && !session.waitingForLobby) {
+      if (session.waitingForHandoff) {
+        setStatus("Connected to the new host. Waiting for the lobby…");
+      } else if (session.role === "guest" && !session.gameCommandIssued && !session.waitingForLobby) {
         beginGuestJoin();
       } else if (session.role === "host") {
         global.setTimeout(function() {
@@ -1838,25 +1945,40 @@
         session.roster.set(joined.peerId, joined);
         renderRoster();
       }
+      if (message.peer && message.peer.role === "host" && session.waitingForHost) {
+        session.waitingForHost = false;
+        setHeader("Host returned", "waiting");
+        setStatus("The host is back. Reconnecting…");
+      }
       await ensurePeer(message.peer, generation, operation);
       return;
     }
     if (message.type === "peer-left") {
       session.roster.delete(message.peerId);
       renderRoster();
+      if (message.reason === "host-away" && session.role === "guest") {
+        session.waitingForHost = true;
+        showDialog();
+        showProgress();
+        setHeader("Host disconnected", "waiting");
+        setStatus("The host disconnected. Waiting for them to return…");
+      }
       var departedTransportPeerId = session.peerAliases.get(message.peerId) || message.peerId;
       if (session.peerStates.get(departedTransportPeerId) === "connected") {
         session.peerAliases.delete(message.peerId);
         if (session.peerSignalTargets.get(departedTransportPeerId) === message.peerId) {
           session.peerSignalTargets.delete(departedTransportPeerId);
         }
-        elements.detail.textContent =
-          "Gameplay is still connected directly; the room link closed.";
+        if (message.reason !== "host-away" && !session.waitingForHandoff) {
+          elements.detail.textContent =
+            "Gameplay is still connected directly; the room link closed.";
+        }
         return;
       }
       removePeer(departedTransportPeerId);
+      if (session.waitingForHandoff || session.waitingForHost || session.role === "host") return;
       if (session.role === "guest" && message.reason === "host-disconnected") {
-        fail(new Error("The host closed the room."));
+        endHostedGame();
       }
       return;
     }
@@ -1892,6 +2014,7 @@
     }
     if (message.type === "admit") {
       session.waitingForLobby = false;
+      session.waitingForHandoff = false;
       setHeader("Joining lobby", "waiting");
       setStatus("The game ended. Joining the lobby…");
       if (session.transportConnected && !session.gameCommandIssued) beginGuestJoin();
@@ -1901,7 +2024,25 @@
       if (elements.listingNote) elements.listingNote.hidden = message.listed === false;
       return;
     }
-    if (message.type === "phase") return;
+    if (message.type === "host-handoff") {
+      if (typeof message.ticket === "string") {
+        await acceptHandoff(message, generation, operation);
+      } else {
+        await followHandoff(message, generation, operation);
+      }
+      return;
+    }
+    if (message.type === "room-closed") {
+      endHostedGame();
+      return;
+    }
+    if (message.type === "phase") {
+      if (message.phase === "lobby" && session.waitingForHandoff) {
+        session.waitingForHandoff = false;
+        if (session.transportConnected && !session.gameCommandIssued) beginGuestJoin();
+      }
+      return;
+    }
     if (message.type === "error") {
       if (message.code === "LISTING_REJECTED" || message.code === "LISTING_FORBIDDEN" ||
           message.code === "DIRECTORY_FULL" ||
@@ -2303,7 +2444,16 @@
       return;
     }
     if (session.role === "host") {
-      publishMatchPhase();
+      if (session.awaitingHandoffReady) {
+        if (state === GAME_STATE.HOSTING) {
+          session.awaitingHandoffReady = false;
+          session.matchPhase = null;
+          publishMatchPhase();
+          try { sendListing(); } catch (error) { /* The invite still works. */ }
+        }
+      } else {
+        publishMatchPhase();
+      }
       if (state === GAME_STATE.HOSTING) {
         if (!session.hostWasReady) showInvite();
         session.hostWasReady = true;
@@ -2339,6 +2489,12 @@
         if (canvas) canvas.focus();
       }, 700);
     } else if (session.guestWasJoined && state === GAME_STATE.IDLE) {
+      if (session.waitingForHost || session.waitingForHandoff) {
+        setStatus(session.waitingForHandoff
+          ? "The match ended. Waiting for the next lobby…"
+          : "The match ended. Waiting to see if the host returns…");
+        return;
+      }
       leave(true);
     }
   }
@@ -2375,6 +2531,10 @@
     session.serverName = null;
     session.matchPhase = null;
     session.waitingForLobby = false;
+    session.waitingForHost = false;
+    session.waitingForHandoff = false;
+    session.awaitingHandoffReady = false;
+    session.hostEnded = false;
     session.listingSentAt = 0;
     syncTelemetryContext();
     renderRoster();
@@ -2387,12 +2547,20 @@
       session.closing = true;
       var pendingWork = [session.messageChain].concat(Array.from(session.peerPromises.values()));
       if (session.role === "host" && session.room && session.roomTicket) {
-        fetchJson("/v1/rooms/" + encodeURIComponent(session.room.id), {
-          method: "DELETE",
-          body: JSON.stringify({ ticket: session.roomTicket }),
-        }).catch(function() {
-          /* The room expires automatically if revocation cannot reach the service. */
-        });
+        var handoff = { ticket: session.roomTicket, listed: session.listPublic === true };
+        if (session.hostSettings) {
+          handoff.map = session.hostSettings.mapName;
+          handoff.mode = session.hostSettings.modeName;
+        }
+        if (session.serverName) handoff.name = session.serverName;
+        try {
+          await fetchJson("/v1/rooms/" + encodeURIComponent(session.room.id), {
+            method: "DELETE",
+            body: JSON.stringify(handoff),
+          });
+        } catch (error) {
+          /* A dropped request still ends the room once the host socket closes. */
+        }
       }
       stopHeartbeat();
       stopGamePolling();
