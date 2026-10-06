@@ -124,6 +124,20 @@ GET /v1/health
 { "ok": true, "v": 1 }
 ```
 
+### List public games
+
+```http
+GET /v1/games?buildId=streamhash-2026-09-28
+```
+
+Returns `{ "v": 1, "games": [...] }`. Each game includes `name`, `hostName`,
+`map`, `mode`, `players`, `capacity`, `open`, `phase` (`lobby` or `live`),
+`queue`, `country`, and `joinCode`. `joinCode` is the public guest invite, never
+the host ticket. Listings older than three minutes are omitted. Joining still
+uses `POST /v1/rooms/:roomId/sessions` and Turnstile. A guest who connects while
+`phase` is `live` receives `admission: "hold"` on `welcome` and an `admit`
+message when the host reports `phase: "lobby"`.
+
 ### Create a room
 
 ```http
