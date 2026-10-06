@@ -46,8 +46,17 @@ interface SessionRow extends Record<string, SqlStorageValue> {
   token_hash: ArrayBuffer;
 }
 
+const HOST_AWAY_GRACE_MS = 8_000;
+
 interface StoredListing {
   joinCode: string;
+  map: MultiplayerMap;
+  mode: MultiplayerMode;
+  name: string;
+}
+
+export interface HandoffHint {
+  listed: boolean;
   map: MultiplayerMap;
   mode: MultiplayerMode;
   name: string;
@@ -193,6 +202,8 @@ const MAX_HOST_WEBSOCKET_MESSAGES_PER_MINUTE = 16_384;
 
 export class SignalingRoom extends DurableObject<Env> {
   private expiring = false;
+  /** Stops a disconnect and an intentional leave from promoting two hosts. */
+  private handoffClaimed = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -357,7 +368,10 @@ export class SignalingRoom extends DurableObject<Env> {
     };
   }
 
-  async closeRoom(ticket: string): Promise<CloseRoomResult> {
+  async closeRoom(
+    ticket: string,
+    hint: HandoffHint | null,
+  ): Promise<CloseRoomResult> {
     const room = this.getRoom();
     if (room === null) {
       await this.expireRoom();
@@ -366,7 +380,8 @@ export class SignalingRoom extends DurableObject<Env> {
     if (!hashesMatch(await hashToken(ticket), room.host_ticket_hash)) {
       return { code: "INVALID_TICKET", ok: false };
     }
-    await this.expireRoom();
+    this.markHostsYielded();
+    await this.handoffOrClose(hint);
     return { ok: true };
   }
 
@@ -447,6 +462,12 @@ export class SignalingRoom extends DurableObject<Env> {
       peerId: session.peer_id,
       role: session.role,
     };
+    if (attachment.role === "host") {
+      const listing = this.readListing();
+      if (listing !== null) attachment.publicListing = listing;
+      this.clearDeparture();
+      this.ctx.waitUntil(this.ctx.storage.setAlarm(room.expires_at));
+    }
     const held = attachment.role === "guest" && this.matchPhase() === "live"
       ? this.enqueueGuest(attachment.peerId, now)
       : null;
@@ -701,7 +722,27 @@ export class SignalingRoom extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
-    await this.expireRoom();
+    const room = this.getRoom();
+    if (room === null) return;
+    const due = this.departureDue();
+    if (
+      due !== null &&
+      Date.now() + 1_000 >= due &&
+      Date.now() < room.expires_at
+    ) {
+      this.clearDeparture();
+      if (!this.expiring && this.connections("host").length === 0) {
+        await this.handoffOrClose(null);
+      }
+      const surviving = this.getRoom();
+      if (surviving !== null && !this.expiring) {
+        await this.ctx.storage.setAlarm(surviving.expires_at);
+      }
+      return;
+    }
+    if (Date.now() >= room.expires_at) {
+      await this.expireRoom();
+    }
   }
 
   private announceDeparture(socket: WebSocket): void {
@@ -724,15 +765,26 @@ export class SignalingRoom extends DurableObject<Env> {
       this.dequeueGuest(attachment.peerId);
       this.notifyQueue();
     }
+    const hostLeft = attachment.role === "host";
+    const yielded = hostLeft && this.hasYielded(attachment.peerId);
+    if (hostLeft && !yielded) {
+      if (this.connections("guest").length > 0) {
+        const at = Date.now() + HOST_AWAY_GRACE_MS;
+        this.writeDeparture(at);
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(at));
+      } else {
+        this.ctx.waitUntil(this.handoffOrClose(null));
+      }
+    }
     this.broadcastToRole(
       {
         identifier: attachment.identifier,
         peerId: attachment.peerId,
-        reason: attachment.role === "host" ? "host-disconnected" : "disconnected",
+        reason: hostLeft && !yielded ? "host-away" : "disconnected",
         type: "peer-left",
         v: SIGNALING_PROTOCOL_VERSION,
       },
-      attachment.role === "host" ? "guest" : "host",
+      hostLeft ? "guest" : "host",
       socket,
     );
     this.broadcastRoster();
@@ -847,6 +899,240 @@ export class SignalingRoom extends DurableObject<Env> {
       }
     }
     return undefined;
+  }
+
+  private markHostsYielded(): void {
+    for (const host of this.connections("host")) {
+      this.rememberYielded(host.attachment.peerId);
+      host.attachment.departed = true;
+      try {
+        host.socket.serializeAttachment(host.attachment);
+      } catch {
+        // The leaving host is already on the way out.
+      }
+    }
+  }
+
+  private rememberYielded(peerId: string): void {
+    this.ensureMatchTables();
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO yielded_host (peer_id) VALUES (?)",
+      peerId,
+    );
+  }
+
+  private hasYielded(peerId: string): boolean {
+    this.ensureMatchTables();
+    return (
+      this.ctx.storage.sql
+        .exec<{ peer_id: string }>(
+          "SELECT peer_id FROM yielded_host WHERE peer_id = ?",
+          peerId,
+        )
+        .toArray()[0] !== undefined
+    );
+  }
+
+  private writeDeparture(at: number): void {
+    this.ensureMatchTables();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO host_departure (singleton, handoff_at) VALUES (1, ?)
+       ON CONFLICT(singleton) DO UPDATE SET handoff_at = excluded.handoff_at`,
+      at,
+    );
+  }
+
+  private clearDeparture(): void {
+    this.ensureMatchTables();
+    this.ctx.storage.sql.exec("DELETE FROM host_departure");
+  }
+
+  private departureDue(): number | null {
+    this.ensureMatchTables();
+    return (
+      this.ctx.storage.sql
+        .exec<{ handoff_at: number }>(
+          "SELECT handoff_at FROM host_departure WHERE singleton = 1",
+        )
+        .toArray()[0]?.handoff_at ?? null
+    );
+  }
+
+  private readListing(): StoredListing | null {
+    this.ensureMatchTables();
+    const row = this.ctx.storage.sql
+      .exec<{
+        join_code: string;
+        map_name: string;
+        mode_name: string;
+        name: string;
+      }>(
+        `SELECT join_code, name, map_name, mode_name
+           FROM public_listing WHERE singleton = 1`,
+      )
+      .toArray()[0];
+    if (row === undefined) return null;
+    if (!isMultiplayerMap(row.map_name) || !isMultiplayerMode(row.mode_name)) {
+      return null;
+    }
+    const name = parseServerName(row.name);
+    if (!name.ok) return null;
+    return {
+      joinCode: row.join_code,
+      map: row.map_name,
+      mode: row.mode_name,
+      name: name.value,
+    };
+  }
+
+  private pickSuccessor():
+    | { attachment: SocketAttachment; socket: WebSocket }
+    | undefined {
+    const queued = new Set(this.queueIds());
+    return this.connections("guest")
+      .filter(({ attachment }) => !queued.has(attachment.peerId))
+      .sort((left, right) =>
+        left.attachment.joinedAt - right.attachment.joinedAt ||
+        left.attachment.peerId.localeCompare(right.attachment.peerId))[0];
+  }
+
+  private async handoffOrClose(hint: HandoffHint | null): Promise<void> {
+    if (this.expiring || this.handoffClaimed) return;
+    this.handoffClaimed = true;
+    try {
+      const listing = this.readListing();
+      const map = listing?.map ?? hint?.map;
+      const mode = listing?.mode ?? hint?.mode;
+      const successor =
+        map === undefined || mode === undefined ? undefined : this.pickSuccessor();
+      if (successor === undefined || map === undefined || mode === undefined) {
+        await this.closeGracefully();
+        return;
+      }
+      await this.promote(successor, {
+        listed: listing !== null,
+        map,
+        mode,
+        name: listing?.name ?? hint?.name ?? map,
+      });
+      this.handoffClaimed = false;
+    } catch (error) {
+      this.handoffClaimed = false;
+      throw error;
+    }
+  }
+
+  private async promote(
+    successor: { attachment: SocketAttachment; socket: WebSocket },
+    settings: HandoffHint,
+  ): Promise<void> {
+    const room = this.getRoom();
+    if (room === null || this.expiring) return;
+    const ticket = randomToken();
+    const ticketHash = await hashToken(ticket);
+    this.ctx.storage.sql.exec(
+      "UPDATE room SET host_ticket_hash = ? WHERE singleton = 1",
+      ticketHash,
+    );
+    const others = this.connections("guest").filter(
+      ({ attachment }) => attachment.peerId !== successor.attachment.peerId,
+    );
+    const listing = this.readListing();
+    successor.attachment.role = "host";
+    if (listing !== null) successor.attachment.publicListing = listing;
+    try {
+      successor.socket.serializeAttachment(successor.attachment);
+    } catch {
+      successor.attachment.role = "guest";
+      await this.closeGracefully();
+      return;
+    }
+    this.ensureMatchTables();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO match_state (singleton, phase) VALUES (1, 'lobby')
+       ON CONFLICT(singleton) DO UPDATE SET phase = 'lobby'`,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO handoff_admit (singleton) VALUES (1) ON CONFLICT(singleton) DO NOTHING",
+    );
+    this.clearDeparture();
+    const hostName = successor.attachment.profile?.name ?? "Spartan";
+    try {
+      successor.socket.send(
+        jsonMessage({
+          listed: settings.listed,
+          map: settings.map,
+          mode: settings.mode,
+          name: settings.name,
+          peers: others.map(({ attachment }) => ({
+            identifier: attachment.identifier,
+            peerId: attachment.peerId,
+            role: attachment.role,
+          })),
+          ticket,
+          type: "host-handoff",
+          v: SIGNALING_PROTOCOL_VERSION,
+        }),
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          message: "failed to offer the room to the next host",
+        }),
+      );
+      await this.closeGracefully();
+      return;
+    }
+    this.broadcastToRole(
+      {
+        hostName,
+        hostPeerId: successor.attachment.peerId,
+        identifier: successor.attachment.identifier,
+        map: settings.map,
+        mode: settings.mode,
+        name: settings.name,
+        type: "host-handoff",
+        v: SIGNALING_PROTOCOL_VERSION,
+      },
+      "guest",
+    );
+    this.broadcastRoster();
+    const surviving = this.getRoom();
+    if (surviving !== null) {
+      await this.ctx.storage.setAlarm(surviving.expires_at);
+    }
+  }
+
+  private consumeHandoffAdmit(): boolean {
+    this.ensureMatchTables();
+    const pending =
+      this.ctx.storage.sql
+        .exec<{ singleton: number }>(
+          "SELECT singleton FROM handoff_admit WHERE singleton = 1",
+        )
+        .toArray()[0] !== undefined;
+    if (!pending) return false;
+    this.ctx.storage.sql.exec("DELETE FROM handoff_admit");
+    return true;
+  }
+
+  private closeGracefully(): Promise<void> {
+    this.markHostsYielded();
+    for (const { socket } of this.connections()) {
+      try {
+        socket.send(
+          jsonMessage({
+            reason: "host-ended",
+            type: "room-closed",
+            v: SIGNALING_PROTOCOL_VERSION,
+          }),
+        );
+      } catch {
+        // Closing the socket still ends the room.
+      }
+    }
+    return this.expireRoom();
   }
 
   private async expireRoom(): Promise<void> {
@@ -1017,6 +1303,16 @@ export class SignalingRoom extends DurableObject<Env> {
         map_name TEXT NOT NULL,
         mode_name TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS host_departure (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        handoff_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS yielded_host (
+        peer_id TEXT PRIMARY KEY
+      );
+      CREATE TABLE IF NOT EXISTS handoff_admit (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+      );
     `);
   }
 
@@ -1170,7 +1466,12 @@ export class SignalingRoom extends DurableObject<Env> {
       { phase, type: "phase", v: SIGNALING_PROTOCOL_VERSION },
       "guest",
     );
-    if (previous === "live" && phase === "lobby") this.admitQueuedGuests();
+    if (
+      (previous === "live" && phase === "lobby") ||
+      (phase === "lobby" && this.consumeHandoffAdmit())
+    ) {
+      this.admitQueuedGuests();
+    }
     this.scheduleListingSync();
   }
 
@@ -1214,6 +1515,7 @@ export class SignalingRoom extends DurableObject<Env> {
     const host = this.connections("host")[0];
     const listing = host?.attachment.publicListing;
     if (host === undefined || listing === undefined) {
+      if (this.departureDue() !== null) return;
       this.clearListing();
       try {
         await this.env.GAMES.getByName(GAME_DIRECTORY_NAME).remove(room.room_id);

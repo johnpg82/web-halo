@@ -18,9 +18,12 @@ import {
   ROOM_ID_PATTERN,
   SIGNALING_PROTOCOL_VERSION,
   TOKEN_PATTERN,
+  isMultiplayerMap,
+  isMultiplayerMode,
   parseBuildId,
   parseCreateRoomInput,
   parseCreateSessionInput,
+  parseServerName,
   type CreateRoomResponse,
   type CreateSessionResponse,
   type ListedGame,
@@ -31,6 +34,7 @@ import {
   SignalingRoom,
   type CreateRoomResult,
   type CreateSessionResult,
+  type HandoffHint,
   type MintedSession,
 } from "./room";
 import { generateIceServersWithFallback, revokeTurnCredential } from "./turn";
@@ -635,6 +639,17 @@ async function createSession(
   return withCors(jsonResponse(body, 201), origin);
 }
 
+function handoffHint(body: Record<string, unknown>): HandoffHint | null {
+  if (!isMultiplayerMap(body.map) || !isMultiplayerMode(body.mode)) return null;
+  const name = parseServerName(body.name);
+  return {
+    listed: body.listed === true && name.ok,
+    map: body.map,
+    mode: body.mode,
+    name: name.ok ? name.value : body.map,
+  };
+}
+
 async function closeRoom(
   request: Request,
   env: RuntimeEnv,
@@ -654,6 +669,7 @@ async function closeRoom(
   }
   const result = await env.ROOMS.getByName(roomId).closeRoom(
     (body as { ticket: string }).ticket,
+    handoffHint(body as Record<string, unknown>),
   );
   if (!result.ok) {
     throw new HttpError(
