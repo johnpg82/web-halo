@@ -236,6 +236,147 @@ describe("public game browser", () => {
     expect(remaining).toEqual([]);
   });
 
+  it("hands the next lobby to the earliest guest when the host leaves", async () => {
+    const room = await createRoom();
+    const host = await connectSession(room.host.session.websocketUrl);
+    const listed = nextMessage(host.socket, "listing");
+    host.socket.send(listPublic(room, "Sidewinder night"));
+    expect((await listed).listed).toBe(true);
+
+    const firstBody = await createGuestSession(room, "66778899aabb");
+    const first = await connectSession(firstBody.session.websocketUrl);
+    const secondBody = await createGuestSession(room, "66778899aabc");
+    const second = await connectSession(secondBody.session.websocketUrl);
+    const named = nextMessage(first.socket, "roster");
+    first.socket.send(JSON.stringify({
+      profile: { name: "Cortana", style: "cyan" },
+      type: "profile",
+      v: 1,
+    }));
+    await named;
+
+    const live = nextMessage(first.socket, "phase");
+    host.socket.send(JSON.stringify({ phase: "live", type: "phase", v: 1 }));
+    await live;
+    const queuedBody = await createGuestSession(room, "66778899aabd");
+    const queued = await connectSession(queuedBody.session.websocketUrl);
+    expect(queued.welcome).toMatchObject({ admission: "hold" });
+
+    const successorHandoff = nextMessage(first.socket, "host-handoff");
+    const followerHandoff = nextMessage(second.socket, "host-handoff");
+    const response = await exports.default.fetch(
+      new Request(`${API_ORIGIN}/v1/rooms/${room.room.id}`, {
+        body: JSON.stringify({
+          listed: true,
+          map: "Sidewinder",
+          mode: "Capture the Flag",
+          name: "Sidewinder night",
+          ticket: room.host.ticket,
+        }),
+        headers: { "Content-Type": "application/json", Origin: GAME_ORIGIN },
+        method: "DELETE",
+      }),
+    );
+    expect(response.status).toBe(204);
+
+    const successor = await successorHandoff;
+    expect(successor).toMatchObject({
+      listed: true,
+      map: "Sidewinder",
+      mode: "Capture the Flag",
+      name: "Sidewinder night",
+      type: "host-handoff",
+    });
+    expect(successor.ticket).toEqual(expect.any(String));
+    expect(JSON.stringify(await followerHandoff)).not.toContain(successor.ticket);
+    expect(await followerHandoff).toMatchObject({
+      hostName: "Cortana",
+      hostPeerId: first.welcome.self &&
+        (first.welcome.self as { peerId: string }).peerId,
+      type: "host-handoff",
+    });
+
+    const admitted = nextMessage(queued.socket, "admit");
+    first.socket.send(JSON.stringify({ phase: "lobby", type: "phase", v: 1 }));
+    expect(await admitted).toMatchObject({ type: "admit" });
+
+    let games = await gamesFor(room);
+    for (
+      let attempt = 0;
+      games[0]?.hostName !== "Cortana" && attempt < 20;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      games = await gamesFor(room);
+    }
+    expect(games[0]).toMatchObject({ hostName: "Cortana", phase: "lobby" });
+
+    const staleClose = await exports.default.fetch(
+      new Request(`${API_ORIGIN}/v1/rooms/${room.room.id}`, {
+        body: JSON.stringify({ ticket: room.host.ticket }),
+        headers: { "Content-Type": "application/json", Origin: GAME_ORIGIN },
+        method: "DELETE",
+      }),
+    );
+    expect(staleClose.status).toBe(404);
+    const successorClose = await exports.default.fetch(
+      new Request(`${API_ORIGIN}/v1/rooms/${room.room.id}`, {
+        body: JSON.stringify({ ticket: successor.ticket }),
+        headers: { "Content-Type": "application/json", Origin: GAME_ORIGIN },
+        method: "DELETE",
+      }),
+    );
+    expect(successorClose.status).toBe(204);
+  });
+
+  it("tells a queued player when the host ends an empty game", async () => {
+    const room = await createRoom();
+    const host = await connectSession(room.host.session.websocketUrl);
+    host.socket.send(JSON.stringify({ phase: "live", type: "phase", v: 1 }));
+    const guestBody = await createGuestSession(room);
+    const guest = await connectSession(guestBody.session.websocketUrl);
+    expect(guest.welcome).toMatchObject({ admission: "hold" });
+
+    const closed = nextMessage(guest.socket, "room-closed");
+    const response = await exports.default.fetch(
+      new Request(`${API_ORIGIN}/v1/rooms/${room.room.id}`, {
+        body: JSON.stringify({ ticket: room.host.ticket }),
+        headers: { "Content-Type": "application/json", Origin: GAME_ORIGIN },
+        method: "DELETE",
+      }),
+    );
+    expect(response.status).toBe(204);
+    expect(await closed).toMatchObject({ reason: "host-ended", type: "room-closed" });
+    expect(await gamesFor(room)).toEqual([]);
+  });
+
+  it("waits before replacing a host whose connection drops", async () => {
+    const room = await createRoom();
+    const host = await connectSession(room.host.session.websocketUrl);
+    const listed = nextMessage(host.socket, "listing");
+    host.socket.send(listPublic(room, "Still here"));
+    await listed;
+    const guestBody = await createGuestSession(room);
+    const guest = await connectSession(guestBody.session.websocketUrl);
+
+    const away = nextMessage(guest.socket, "peer-left");
+    host.socket.close(1000, "dropped");
+    expect(await away).toMatchObject({ reason: "host-away", type: "peer-left" });
+
+    const returnedResponse = await exports.default.fetch(
+      jsonRequest(`/v1/rooms/${room.room.id}/sessions`, {
+        buildId: BUILD_ID,
+        identifier: "001122334455",
+        protocolVersion: 1,
+        ticket: room.host.ticket,
+      }),
+    );
+    expect(returnedResponse.status).toBe(201);
+    const returned = await returnedResponse.json<{ session: { role: string } }>();
+    expect(returned.session.role).toBe("host");
+    expect(await gamesFor(room)).toHaveLength(1);
+  });
+
   it("filters the list to the requested build", async () => {
     const room = await createRoom();
     const host = await connectSession(room.host.session.websocketUrl);
